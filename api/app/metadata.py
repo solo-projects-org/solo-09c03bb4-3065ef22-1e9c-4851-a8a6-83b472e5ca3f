@@ -52,6 +52,18 @@ CREATE TABLE IF NOT EXISTS rotation_jobs (
 TERMINAL_STATES = ("completed", "failed")
 
 
+class IdempotencyConflict(Exception):
+    """插入时幂等令牌已被另一行占用（并发同令牌上传）。
+
+    携带当前占用行，调用方据此返回明确的 409 冲突而不是 500。
+    """
+
+    def __init__(self, holder: dict[str, Any]):
+        super().__init__(f"idempotency token held by {holder['image_id']} "
+                         f"({holder['status']})")
+        self.holder = holder
+
+
 class MetadataDB:
     """每线程独立连接（SQLite 连接不跨线程复用），写操作串行化。"""
 
@@ -87,22 +99,58 @@ class MetadataDB:
                      content_type: str | None, master_key_id: str,
                      wrapped_dek: str, blob_path: str,
                      idem_token: str | None) -> str:
+        """插入一行 receiving 元数据。
+
+        并发同令牌（或同 image_id）冲突时抛出 IdempotencyConflict，
+        绝不静默复用他人行号——否则会让重复请求的密文残片成为无主文件，
+        也会在最终化阶段触发 500。调用方负责捕获并转成 409。
+        """
         with self._write_lock:
-            if idem_token:
-                existing = self.conn.execute(
-                    "SELECT image_id FROM images WHERE idem_token=?",
-                    (idem_token,)).fetchone()
-                if existing:
-                    return existing["image_id"]
             now = time.time()
-            self.conn.execute(
-                "INSERT INTO images (image_id, filename, content_type, status, "
-                "master_key_id, wrapped_dek, blob_path, idem_token, created_at) "
-                "VALUES (?,?,?, 'receiving', ?,?,?,?,?)",
-                (image_id, filename, content_type, master_key_id,
-                 wrapped_dek, blob_path, idem_token, now))
-            self.conn.commit()
+            try:
+                self.conn.execute(
+                    "INSERT INTO images (image_id, filename, content_type, status, "
+                    "master_key_id, wrapped_dek, blob_path, idem_token, created_at) "
+                    "VALUES (?,?,?, 'receiving', ?,?,?,?,?)",
+                    (image_id, filename, content_type, master_key_id,
+                     wrapped_dek, blob_path, idem_token, now))
+                self.conn.commit()
+            except sqlite3.IntegrityError:
+                # UNIQUE(idem_token) 或 PRIMARY KEY(image_id) 冲突
+                self.conn.rollback()
+                holder = None
+                if idem_token:
+                    row = self.conn.execute(
+                        "SELECT * FROM images WHERE idem_token=?",
+                        (idem_token,)).fetchone()
+                    if row is not None:
+                        holder = dict(row)
+                if holder is None:
+                    row = self.conn.execute(
+                        "SELECT * FROM images WHERE image_id=?",
+                        (image_id,)).fetchone()
+                    holder = dict(row) if row else {
+                        "image_id": image_id, "status": "unknown"}
+                raise IdempotencyConflict(holder)
             return image_id
+
+    def delete_failed_image(self, image_id: str) -> dict[str, Any] | None:
+        """删除 failed 行以复用其编号（按号上传重试）。
+
+        仅允许删除 failed 行；receiving/ready 行受调用方前置 409 保护。
+        返回被删行（含 blob_path，供调用方清理残片），不存在则返回 None。
+        """
+        with self._write_lock:
+            row = self.conn.execute(
+                "SELECT * FROM images WHERE image_id=?", (image_id,)).fetchone()
+            if row is None:
+                return None
+            if row["status"] != "failed":
+                return dict(row)
+            self.conn.execute("DELETE FROM images WHERE image_id=? AND status='failed'",
+                              (image_id,))
+            self.conn.commit()
+            return dict(row)
 
     def get_image(self, image_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
@@ -115,20 +163,30 @@ class MetadataDB:
         return dict(row) if row else None
 
     def finalize_image(self, image_id: str, plain_size: int, enc_size: int,
-                       sha256: str) -> None:
+                       sha256: str) -> bool:
+        """条件最终化：仅 receiving 行可发布为 ready。
+
+        返回 True 表示本次调用完成发布；False 表示该行已不在 receiving
+        （例如并发失败/重启恢复抢先判失败），调用方必须按失败处理并清理
+        密文残片，绝不把不可读原片发布出去。
+        """
         with self._write_lock:
-            self.conn.execute(
+            cur = self.conn.execute(
                 "UPDATE images SET status='ready', plain_size=?, enc_size=?, "
-                "sha256=?, finalized_at=?, error=NULL WHERE image_id=?",
+                "sha256=?, finalized_at=?, error=NULL "
+                "WHERE image_id=? AND status='receiving'",
                 (plain_size, enc_size, sha256, time.time(), image_id))
             self.conn.commit()
+            return cur.rowcount > 0
 
     def fail_image(self, image_id: str, error: str) -> None:
         with self._write_lock:
-            # 失败行释放幂等令牌，允许客户端用同一令牌重新发起上传
+            # 只判失败仍在途的行：ready 回执一旦发出不可撤回；
+            # 失败行释放幂等令牌，允许客户端用同一令牌重新发起上传。
             self.conn.execute(
                 "UPDATE images SET status='failed', error=?, finalized_at=?, "
-                "idem_token=NULL WHERE image_id=?",
+                "idem_token=NULL, sha256=NULL, plain_size=NULL, enc_size=NULL "
+                "WHERE image_id=? AND status='receiving'",
                 (error[:500], time.time(), image_id))
             self.conn.commit()
 
@@ -176,16 +234,30 @@ class MetadataDB:
             self.conn.commit()
             return cur.rowcount > 0
 
-    def mark_stale_receiving_failed(self) -> int:
+    def mark_stale_receiving_failed(self) -> list[dict[str, Any]]:
         """进程重启后，所有 receiving 都是上次崩溃的在途上传，
-        不允许晚发布（防止它依赖已销毁的旧 MK 才完成）。"""
+        不允许晚发布（防止它依赖已销毁的旧 MK 才完成）。
+
+        同时释放幂等令牌（原令牌可立即用于重传），并返回受影响行，
+        供启动流程逐件删除密文残片，保证失败请求不留无主密文。
+        """
         with self._write_lock:
-            cur = self.conn.execute(
-                "UPDATE images SET status='failed', "
-                "error='interrupted by service restart', finalized_at=? "
-                "WHERE status='receiving'", (time.time(),))
-            self.conn.commit()
-            return cur.rowcount
+            rows = self.conn.execute(
+                "SELECT * FROM images WHERE status='receiving'").fetchall()
+            stale = [dict(r) for r in rows]
+            if stale:
+                self.conn.execute(
+                    "UPDATE images SET status='failed', "
+                    "error='interrupted by service restart', finalized_at=?, "
+                    "idem_token=NULL, sha256=NULL, plain_size=NULL, enc_size=NULL "
+                    "WHERE status='receiving'", (time.time(),))
+                self.conn.commit()
+            return stale
+
+    def known_blob_paths(self) -> set[str]:
+        """元数据库登记过的全部 blob 路径（含 failed 行）。"""
+        rows = self.conn.execute("SELECT blob_path FROM images").fetchall()
+        return {r["blob_path"] for r in rows}
 
     # ---- 轮换作业 -------------------------------------------------------
     def active_rotation(self) -> dict | None:

@@ -33,13 +33,18 @@ MultiPartParser.spool_max_size = MAX_UPLOAD_BYTES
 
 from .crypto_stream import IntegrityError, decrypt_stream, encrypt_stream
 from .keyclient import KeyClient, KeyServiceError
-from .metadata import MetadataDB
+from .metadata import IdempotencyConflict, MetadataDB
 from .rotation import RotationWorker
 
 db = MetadataDB(DB_PATH)
 keys = KeyClient(KEY_SERVICE_URL, KEY_SERVICE_TOKEN)
 worker: RotationWorker | None = None
 main_loop: asyncio.AbstractEventLoop | None = None
+
+# 在途幂等令牌注册表：单实例内，同一令牌并发上传时第二个请求立即得到 409，
+# 不生成第二件原片/第二份密文。事件循环单线程，set 的检查与插入之间无 await，
+# 原子成立；DB 的 UNIQUE(idem_token) 约束作为第二道防线。
+_inflight_tokens: set[str] = set()
 
 
 # --------------------------------------------------------------------------
@@ -59,8 +64,14 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(1.0)
     # 崩溃恢复：上次 receiving 的上传一律失败，禁止"晚发布"依赖旧密钥
     stale = db.mark_stale_receiving_failed()
+    for row in stale:
+        _safe_remove_blob(row["blob_path"])
     if stale:
-        print(f"[startup] {stale} interrupted upload(s) marked failed")
+        print(f"[startup] {len(stale)} interrupted upload(s) marked failed")
+    # 密文残片对账：删除元数据库不再登记的无主 .msef（崩溃/清理失败的兜底）
+    removed = _reap_orphan_blobs()
+    if removed:
+        print(f"[startup] removed {removed} orphaned ciphertext blob(s)")
     # 崩溃对账：上次可能已在密钥服务切换了 MK、却没来得及建本地作业
     try:
         key_status = await keys.master_status()
@@ -97,6 +108,34 @@ def _key_error(exc: KeyServiceError) -> HTTPException:
                          detail={"code": exc.code, "message": exc.message})
 
 
+def _safe_remove_blob(blob_path: str) -> bool:
+    """尽力删除密文残片；文件不存在视为已清理，不抛异常。"""
+    try:
+        os.remove(blob_path)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        print(f"[warn] could not remove blob {blob_path}: {exc!r}")
+        return False
+
+
+def _reap_orphan_blobs() -> int:
+    """删除 BLOB_DIR 下未被元数据库登记的 .msef 残片（启动对账兜底）。"""
+    try:
+        names = os.listdir(BLOB_DIR)
+    except FileNotFoundError:
+        return 0
+    known = {os.path.basename(p) for p in db.known_blob_paths()}
+    removed = 0
+    for name in names:
+        if not name.endswith(".msef") or name in known:
+            continue
+        if _safe_remove_blob(os.path.join(BLOB_DIR, name)):
+            removed += 1
+    return removed
+
+
 # --------------------------------------------------------------------------
 # 上传
 # --------------------------------------------------------------------------
@@ -125,8 +164,13 @@ async def _finalize_with_rebind(image_id: str, stats: dict[str, Any]) -> dict[st
     防止在途上传晚发布依赖旧（甚至已销毁）主密钥的原片。
     """
     meta = db.get_image(image_id)
+    if meta is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "upload_aborted",
+                    "message": "upload metadata row no longer exists"})
     job = db.latest_rotation()
-    if job and meta and meta["master_key_id"] == job["old_key_id"]:
+    if job and meta["master_key_id"] == job["old_key_id"]:
         try:
             res = await keys.rewrap(meta["master_key_id"], meta["wrapped_dek"],
                                     f"finalize:{image_id}")
@@ -141,8 +185,25 @@ async def _finalize_with_rebind(image_id: str, stats: dict[str, Any]) -> dict[st
             raise
         db.rewrap_row(image_id, meta["master_key_id"],
                       res["key_id"], res["wrapped_dek"])
-    db.finalize_image(image_id, stats["plain_size"], stats["enc_size"],
-                      stats["sha256"])
+    # 发布前核对落盘密文：ready 回执必须对应真实可读、尺寸一致的密文原片
+    try:
+        actual_enc_size = os.path.getsize(meta["blob_path"])
+    except OSError as exc:
+        raise HTTPException(status_code=502,
+                            detail=f"ciphertext blob unavailable: {exc!r}") from exc
+    if actual_enc_size != stats["enc_size"]:
+        raise HTTPException(
+            status_code=502,
+            detail=f"ciphertext size mismatch: disk={actual_enc_size} "
+                   f"expected={stats['enc_size']}")
+    published = db.finalize_image(image_id, stats["plain_size"], stats["enc_size"],
+                                  stats["sha256"])
+    if not published:
+        # 行已被并发失败/重启恢复判失败：绝不能晚发布
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "upload_aborted",
+                    "message": "upload was aborted before finalization"})
     return db.get_image(image_id)
 
 
@@ -152,20 +213,92 @@ def _check_content_length(request: Request):
         raise HTTPException(413, detail="upload exceeds MAX_UPLOAD_BYTES")
 
 
-@app.post("/images", status_code=201,
-          summary="上传原片（流式加密；支持 X-Idempotency-Token 幂等）")
-async def upload_image(request: Request, response: Response,
-                       x_idempotency_token: str | None = Header(default=None),
-                       x_filename: str | None = Header(default=None),
-                       x_content_type: str | None = Header(default=None)):
+# --------------------------------------------------------------------------
+# 上传（POST /images 与 PUT /images/{image_id} 共用同一条幂等入仓管线）
+# --------------------------------------------------------------------------
+def _idempotency_conflict(holder: dict[str, Any]) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={"code": "idempotency_conflict",
+                "message": "another upload using the same X-Idempotency-Token "
+                           "is in progress",
+                "image_id": holder.get("image_id"),
+                "status": holder.get("status")})
+
+
+def _replay_receipt(existing: dict[str, Any], response: Response) -> dict[str, Any]:
+    """完成后的幂等重放：回已发布原片的编号与回执。
+
+    只读取既有行，绝不重新入湖，因此正文、SHA-256 摘要与密钥绑定均不变。
+    """
+    response.status_code = 200
+    return {"image_id": existing["image_id"], "status": existing["status"],
+            "idempotent": True, "size": existing["plain_size"],
+            "sha256": existing["sha256"],
+            "master_key_id": existing["master_key_id"]}
+
+
+def _abort_upload(image_id: str, blob_path: str, error: str) -> None:
+    """失败收口：行判 failed 并释放幂等令牌，密文残片同步删除。
+
+    保证失败请求不留无主密文，且原令牌/失败编号可立即用于重传。
+    """
+    db.fail_image(image_id, error)
+    _safe_remove_blob(blob_path)
+
+
+async def _ingest(request: Request, response: Response, image_id: str,
+                  idem_token: str | None, filename: str | None,
+                  content_type: str | None, named: bool) -> dict[str, Any]:
     _check_content_length(request)
-    # 幂等重放：直接返回既有回执，不重复入湖
-    if x_idempotency_token:
-        existing = db.get_by_token(x_idempotency_token)
-        if existing:
-            response.status_code = 200
-            return {"image_id": existing["image_id"], "status": existing["status"],
-                    "idempotent": True}
+
+    # 1) 权威判断以元数据库为准（进程重启后内存注册表清空也不受影响）
+    if idem_token:
+        existing = db.get_by_token(idem_token)
+        if existing is not None:
+            if existing["status"] == "ready":
+                # 完成后重放：返回已发布原片，不改正文/摘要/密钥绑定
+                return _replay_receipt(existing, response)
+            # receiving：同令牌并发，另一笔仍在途 -> 明确冲突
+            # failed 行的令牌在判失败时已释放，查不到；兜底同样按冲突处理
+            raise _idempotency_conflict(existing)
+        # 2) 进程内快速拦截同令牌并发（DB 的 UNIQUE 约束为第二道防线）。
+        #    检查与插入之间无 await，事件循环单线程 -> 原子。
+        if idem_token in _inflight_tokens:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "idempotency_in_flight",
+                        "message": "an upload with this X-Idempotency-Token is "
+                                   "already in progress"})
+        _inflight_tokens.add(idem_token)
+    try:
+        return await _run_ingest(request, image_id, idem_token, filename,
+                                 content_type, named)
+    finally:
+        if idem_token is not None:
+            _inflight_tokens.discard(idem_token)
+
+
+async def _run_ingest(request: Request, image_id: str,
+                      idem_token: str | None, filename: str | None,
+                      content_type: str | None, named: bool) -> dict[str, Any]:
+    blob_path = os.path.join(BLOB_DIR, image_id + ".msef")
+
+    if named:
+        current = db.get_image(image_id)
+        if current is not None:
+            if current["status"] in ("receiving", "ready"):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "image_id_exists",
+                            "message": f"image_id already exists "
+                                       f"({current['status']})",
+                            "image_id": image_id})
+            # failed：允许按号复用失败编号，删除旧失败行并清理其残片
+            old = db.delete_failed_image(image_id)
+            if old is not None:
+                _safe_remove_blob(old["blob_path"])
+
     try:
         dek_resp = await keys.generate_dek()
     except KeyServiceError as exc:
@@ -174,31 +307,27 @@ async def upload_image(request: Request, response: Response,
     wrapped_dek = dek_resp["wrapped_dek"]
     dek = bytes.fromhex(dek_resp["dek"])  # 仅存于本请求内存
 
-    image_id = "img-" + uuid.uuid4().hex
-    blob_path = os.path.join(BLOB_DIR, image_id + ".msef")
-    db.create_image(image_id, x_filename,
-                    x_content_type or request.headers.get("content-type"),
-                    master_key_id, wrapped_dek, blob_path, x_idempotency_token)
     try:
-        stats = await _stream_to_blob(request, blob_path, dek)
-        if stats["plain_size"] > MAX_UPLOAD_BYTES:
-            raise HTTPException(413, detail="upload exceeds MAX_UPLOAD_BYTES")
-        final = await _finalize_with_rebind(image_id, stats)
-    except HTTPException:
-        db.fail_image(image_id, "upload rejected")
         try:
-            os.remove(blob_path)
-        except OSError:
-            pass
-        raise
-    except Exception as exc:  # 写入失败：判失败并清理密文残片
-        db.fail_image(image_id, f"upload failed: {exc!r}")
+            db.create_image(
+                image_id, filename,
+                content_type or request.headers.get("content-type"),
+                master_key_id, wrapped_dek, blob_path, idem_token)
+        except IdempotencyConflict as exc:
+            # 并发穿透的兜底（前面已有两层拦截）：明确 409，不产生密文残片
+            raise _idempotency_conflict(exc.holder)
         try:
-            os.remove(blob_path)
-        except OSError:
-            pass
-        raise HTTPException(status_code=502,
-                            detail=f"upload failed: {exc!r}") from exc
+            stats = await _stream_to_blob(request, blob_path, dek)
+            if stats["plain_size"] > MAX_UPLOAD_BYTES:
+                raise HTTPException(413, detail="upload exceeds MAX_UPLOAD_BYTES")
+            final = await _finalize_with_rebind(image_id, stats)
+        except HTTPException:
+            _abort_upload(image_id, blob_path, "upload rejected")
+            raise
+        except Exception as exc:  # 写入失败：判失败并清理密文残片
+            _abort_upload(image_id, blob_path, f"upload failed: {exc!r}")
+            raise HTTPException(status_code=502,
+                                detail=f"upload failed: {exc!r}") from exc
     finally:
         del dek  # 尽快丢弃明文 DEK 引用
     return {"image_id": image_id, "status": "ready",
@@ -206,57 +335,27 @@ async def upload_image(request: Request, response: Response,
             "master_key_id": final["master_key_id"]}
 
 
+@app.post("/images", status_code=201,
+          summary="上传原片（流式加密；支持 X-Idempotency-Token 幂等）")
+async def upload_image(request: Request, response: Response,
+                       x_idempotency_token: str | None = Header(default=None),
+                       x_filename: str | None = Header(default=None),
+                       x_content_type: str | None = Header(default=None)):
+    image_id = "img-" + uuid.uuid4().hex
+    return await _ingest(request, response, image_id, x_idempotency_token,
+                         x_filename, x_content_type, named=False)
+
+
 @app.put("/images/{image_id}", status_code=201,
-         summary="按调用方指定编号上传原片")
+         summary="按调用方指定编号上传原片（失败编号可复用；支持幂等令牌）")
 async def upload_image_named(image_id: str, request: Request, response: Response,
                              x_idempotency_token: str | None = Header(default=None),
                              x_filename: str | None = Header(default=None),
                              x_content_type: str | None = Header(default=None)):
     if not image_id or len(image_id) > 128 or "/" in image_id or ".." in image_id:
         raise HTTPException(400, detail="invalid image_id")
-    _check_content_length(request)
-    if x_idempotency_token:
-        existing = db.get_by_token(x_idempotency_token)
-        if existing:
-            response.status_code = 200
-            return {"image_id": existing["image_id"], "status": existing["status"],
-                    "idempotent": True}
-    current = db.get_image(image_id)
-    if current and current["status"] in ("receiving", "ready"):
-        raise HTTPException(409, detail=f"image_id already exists ({current['status']})")
-    try:
-        dek_resp = await keys.generate_dek()
-    except KeyServiceError as exc:
-        raise _key_error(exc)
-    blob_path = os.path.join(BLOB_DIR, image_id + ".msef")
-    db.create_image(image_id, x_filename,
-                    x_content_type or request.headers.get("content-type"),
-                    dek_resp["key_id"], dek_resp["wrapped_dek"],
-                    blob_path, x_idempotency_token)
-    dek = bytes.fromhex(dek_resp["dek"])
-    try:
-        stats = await _stream_to_blob(request, blob_path, dek)
-        final = await _finalize_with_rebind(image_id, stats)
-    except HTTPException:
-        db.fail_image(image_id, "upload rejected")
-        try:
-            os.remove(blob_path)
-        except OSError:
-            pass
-        raise
-    except Exception as exc:
-        db.fail_image(image_id, f"upload failed: {exc!r}")
-        try:
-            os.remove(blob_path)
-        except OSError:
-            pass
-        raise HTTPException(status_code=502,
-                            detail=f"upload failed: {exc!r}") from exc
-    finally:
-        del dek
-    return {"image_id": image_id, "status": "ready",
-            "size": stats["plain_size"], "sha256": stats["sha256"],
-            "master_key_id": final["master_key_id"]}
+    return await _ingest(request, response, image_id, x_idempotency_token,
+                         x_filename, x_content_type, named=True)
 
 
 # --------------------------------------------------------------------------

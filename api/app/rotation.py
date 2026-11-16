@@ -115,6 +115,11 @@ class RotationWorker:
                     self._db.fail_image(
                         row["image_id"],
                         "stale receiving upload during key rotation")
+                    # 失败即清理密文残片，不留无主密文
+                    try:
+                        os.remove(row["blob_path"])
+                    except OSError:
+                        pass
                     self._db.bump_rotation(job_id, migrated=1)
                     migrated_now += 1
                 continue

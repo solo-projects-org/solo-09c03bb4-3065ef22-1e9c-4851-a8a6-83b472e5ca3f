@@ -52,7 +52,7 @@ docker compose up --build
 | 方法/路径 | 说明 |
 |---|---|
 | `POST /images` | 流式上传（随机编号）；`X-Idempotency-Token` 幂等；`X-Filename` 可选 |
-| `PUT /images/{image_id}` | 按调用方编号上传 |
+| `PUT /images/{image_id}` | 按调用方编号上传；失败编号可复用；支持同一幂等令牌 |
 | `GET /images/{image_id}` | 按号下载，流式解密、逐帧 GCM 验签、SHA-256 校验 |
 | `GET /images/{image_id}/meta` | 元数据/状态（不返回信封密文） |
 | `GET /images` | 列表 |
@@ -60,6 +60,25 @@ docker compose up --build
 | `GET /rotations/{job_id}` | 轮换进度（state/migrated/failed/progress_percent） |
 | `GET /rotations/latest` | 最近一次轮换 |
 | `GET /keys/status` | 代理密钥服务只读状态 |
+
+## 幂等入仓语义（断线重传对照）
+
+仪器断线重传时，两笔请求可能携带同一个 `X-Idempotency-Token`，系统保证：
+
+1. **同令牌并发至多一件 ready**：同一令牌的并发上传，先到者正常入仓，
+   其余在途请求立即返回 `409 idempotency_in_flight/idempotency_conflict`
+   （携带占用方编号与状态），绝不返回 500，也不产生第二份密文。
+2. **完成后重放返回已发布回执**：令牌对应原片一旦 `ready`，后续同令牌请求
+   返回 `200` + 同一 `image_id`、同一摘要/尺寸/密钥绑定（`idempotent: true`），
+   即使请求正文不同也不会重写原片。
+3. **失败后允许原令牌重传**：任何失败（客户端断线、413、密钥错误、服务重启
+   中断）在判 `failed` 时即释放令牌并删除密文残片；客户端可用**原令牌**重传。
+4. **按号上传可复用失败编号**：`PUT /images/{id}` 对 `failed` 编号先清旧行再
+   重新入仓；对 `receiving/ready` 编号仍返回 `409 image_id_exists`。
+5. **失败不留无主密文**：请求级失败同步删除 blob；进程重启时把残留
+   `receiving` 行判失败、删除其 blob，并对账清理任何未登记的 `.msef` 残片。
+6. **ready 即可读**：发布前核对落盘密文尺寸且仅 `receiving` 行能转 `ready`，
+   所有 ready 回执都对应逐字节可读、SHA-256 一致的原片。
 
 上传请使用原始 `application/octet-stream`（`curl --data-binary @file`），
 避免 multipart 带来的额外内存占用。
@@ -114,12 +133,15 @@ KEY_DESTROY_DROP_RECEIPT=true docker compose up --build keystore
 ## 自测
 
 ```bash
-# tests/ 下为真实 uvicorn 子进程的端到端测试（22 项，含离线加密单测）
+# tests/ 下为真实 uvicorn 子进程的端到端测试（30 项，含离线加密单测）
 python -m pytest tests/ -q
 ```
 
 覆盖：逐字节往返（空文件/跨帧/多帧、密文布局尺寸）、信封 AAD/错钥拒绝、
 明文不落盘（blob/元数据库/临时文件三处核查）、幂等上传与密钥操作幂等、
+**同令牌/同编号并发（至多一件 ready、其余明确 409、无 500、无无主密文）、
+完成后重放不改正文/摘要/密钥绑定、失败与重启中断后原令牌重传、失败编号复用、
+孤儿密文对账清理**、
 篡改 GCM 失败、完整轮换（信封迁移+正文不动+二次轮换仍不动+销毁后可读）、
 进度与并发轮换拒绝、慢密钥服务并发、在途下载跨销毁、销毁丢回执自动核实、
 双服务重启可读性、轮换中途重启接续、崩溃在途上传不晚发布、
